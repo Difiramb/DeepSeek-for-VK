@@ -1,3 +1,4 @@
 vkbottle
 openai
 python-dotenv
+aiohttp
