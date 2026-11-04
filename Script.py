@@ -38,7 +38,7 @@ except Exception as e:
     print(f"!!! Ошибка импорта openai: {e}")
     sys.exit(1)
 
-client = OpenAI(base_url="http://127.0.0.1:9655/v1", api_key="not-needed")
+client = OpenAI(base_url="http://127.0.0.1:3000/v1", api_key="not-needed")
 bot = Bot(token=VK_TOKEN)
 
 # --- Конфигурация ---
