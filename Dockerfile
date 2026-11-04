@@ -25,4 +25,7 @@ ENV HOST=0.0.0.0
 ENV PORT=3000
 
 # Запускаем оба процесса
-CMD ["sh", "-c", "node FreeDeepseekAPI/server.js & python3 Script.py"]
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]
