@@ -24,6 +24,7 @@ ENV NON_INTERACTIVE=1
 ENV HOST=0.0.0.0
 ENV PORT=3000
 
+RUN apt-get update && apt-get install -y supervisor
 # Запускаем оба процесса
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
