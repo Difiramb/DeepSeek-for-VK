@@ -33,3 +33,6 @@ CMD ["/app/start.sh"]
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+
+RUN which python3 && python3 --version
+RUN ls -la /app && ls -la /app/FreeDeepseekAPI
