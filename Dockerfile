@@ -1,9 +1,8 @@
-# Базовый образ с Node.js
 FROM node:20-slim
 
-# Устанавливаем Python и pip
+# Устанавливаем Python, pip, venv и supervisor
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip && \
+    apt-get install -y python3 python3-pip python3-venv supervisor && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -11,28 +10,22 @@ WORKDIR /app
 # Копируем весь проект
 COPY . .
 
-# --- Настройка и сборка Node.js-прокси ---
+# --- Настройка Node.js-прокси ---
 WORKDIR /app/FreeDeepseekAPI
 RUN npm install --omit=dev
 
-# --- Установка Python-зависимостей ---
+# --- Настройка Python-зависимостей через venv (решает ошибку externally-managed) ---
 WORKDIR /app
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN python3 -m venv /opt/venv
+RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Переменные для прокси: отключаем меню и слушаем все интерфейсы
+# Переменные для прокси
 ENV NON_INTERACTIVE=1
 ENV HOST=0.0.0.0
 ENV PORT=3000
 
-RUN apt-get update && apt-get install -y supervisor
-# Запускаем оба процесса
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
-
-CMD ["/app/start.sh"]
-
+# Копируем конфиг supervisor
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
 
-RUN which python3 && python3 --version
-RUN ls -la /app && ls -la /app/FreeDeepseekAPI
+# Запускаем supervisor — он поднимет оба процесса
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
