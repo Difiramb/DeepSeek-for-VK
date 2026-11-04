@@ -1,0 +1,1025 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+const ROOT = path.resolve(__dirname, '..');
+const serverInternals = require('../server.js').__test;
+
+function tmpdir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
+}
+
+function runNode(args, opts = {}) {
+  return spawnSync(process.execPath, args, {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, ...opts.env },
+  });
+}
+
+test('auth import copies valid deepseek-auth.json and chmods it to 0600', () => {
+  const dir = tmpdir();
+  const src = path.join(dir, 'source-auth.json');
+  const dst = path.join(dir, 'deepseek-auth.json');
+  fs.writeFileSync(src, JSON.stringify({
+    token: 'tok_123',
+    cookie: 'ds_session_id=abc; other=def',
+    hif_dliq: 'dliq',
+    hif_leim: 'leim',
+    wasmUrl: 'https://example.com/sha3.wasm',
+  }));
+
+  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst]);
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  const imported = JSON.parse(fs.readFileSync(dst, 'utf8'));
+  assert.equal(imported.token, 'tok_123');
+  assert.match(imported.cookie, /ds_session_id=abc/);
+  if (process.platform !== 'win32') {
+    assert.equal((fs.statSync(dst).mode & 0o777), 0o600);
+  }
+});
+
+test('auth import accepts browser cookie export plus token env', () => {
+  const dir = tmpdir();
+  const src = path.join(dir, 'cookies.json');
+  const dst = path.join(dir, 'deepseek-auth.json');
+  fs.writeFileSync(src, JSON.stringify([
+    { domain: '.deepseek.com', name: 'ds_session_id', value: 'abc' },
+    { domain: 'chat.deepseek.com', name: 'smidV2', value: 'smid' },
+    { domain: 'example.com', name: 'ignored', value: 'nope' },
+  ]));
+
+  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst], { env: { DEEPSEEK_TOKEN: 'tok_env' } });
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  const imported = JSON.parse(fs.readFileSync(dst, 'utf8'));
+  assert.equal(imported.token, 'tok_env');
+  assert.equal(imported.cookie, 'ds_session_id=abc; smidV2=smid');
+});
+
+test('auth import rejects token passed as CLI arg before prompting or reading files', () => {
+  const dir = tmpdir();
+  const src = path.join(dir, 'cookies.json');
+  const dst = path.join(dir, 'deepseek-auth.json');
+  fs.writeFileSync(src, JSON.stringify([{ domain: '.deepseek.com', name: 'ds_session_id', value: 'abc' }]));
+
+  const res = runNode(['scripts/auth_import.js', '--input', src, '--output', dst, '--token', 'tok_cli']);
+  assert.equal(res.status, 2);
+  assert.match(res.stderr + res.stdout, /Refusing --token/i);
+  assert.equal(fs.existsSync(dst), false);
+
+  const noInput = runNode(['scripts/auth_import.js', '--token', 'tok_cli']);
+  assert.equal(noInput.status, 2);
+  assert.match(noInput.stderr + noInput.stdout, /Refusing --token/i);
+
+  const badInput = runNode(['scripts/auth_import.js', '--input', path.join(dir, 'missing.json'), '--token', 'tok_cli']);
+  assert.equal(badInput.status, 2);
+  assert.match(badInput.stderr + badInput.stdout, /Refusing --token/i);
+});
+
+test('auth import help ignores comma-list DEEPSEEK_AUTH_PATH as default output', () => {
+  const dir = tmpdir();
+  const a = path.join(dir, 'a.json');
+  const b = path.join(dir, 'b.json');
+  const res = runNode(['scripts/auth_import.js', '--help'], { env: { DEEPSEEK_AUTH_PATH: `${a},${b}` } });
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  assert.doesNotMatch(res.stdout, new RegExp(`${a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')},`));
+  assert.match(res.stdout, /deepseek-auth\.json/);
+});
+
+test('doctor reports auth problems without requiring Chrome or network', () => {
+  const dir = tmpdir();
+  const authPath = path.join(dir, 'broken-auth.json');
+  fs.writeFileSync(authPath, JSON.stringify({ token: '', cookie: '' }));
+  const res = runNode(['scripts/doctor.js', '--offline'], { env: { DEEPSEEK_AUTH_PATH: authPath } });
+  assert.notEqual(res.status, 0);
+  assert.match(res.stdout + res.stderr, /token missing/i);
+  assert.match(res.stdout + res.stderr, /cookie missing/i);
+});
+
+test('chrome auth prints actionable OS instructions when Chrome is missing', () => {
+  const dir = tmpdir();
+  const fakeChrome = path.join(dir, 'missing-chrome');
+  const res = runNode(['scripts/deepseek_chrome_auth.js'], { env: { CHROME_PATH: fakeChrome } });
+  assert.notEqual(res.status, 0);
+  const out = res.stdout + res.stderr;
+  assert.match(out, /Windows/i);
+  assert.match(out, /macOS/i);
+  assert.match(out, /Linux/i);
+  assert.match(out, /CHROME_PATH/i);
+});
+
+test('chrome extension manifest only declares icon files that exist', () => {
+  const manifestPath = path.join(ROOT, 'chrome-extension', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const iconPaths = [];
+
+  function collectIconPaths(value, key = '') {
+    if (typeof value === 'string') {
+      if (key === 'icons' || key === 'default_icon') iconPaths.push(value);
+      return;
+    }
+
+    if (!value || typeof value !== 'object') return;
+
+    if ((key === 'icons' || key === 'default_icon') && !Array.isArray(value)) {
+      for (const iconPath of Object.values(value)) {
+        if (typeof iconPath === 'string') iconPaths.push(iconPath);
+      }
+      return;
+    }
+
+    for (const [childKey, childValue] of Object.entries(value)) {
+      collectIconPaths(childValue, childKey);
+    }
+  }
+
+  collectIconPaths(manifest);
+
+  for (const iconPath of iconPaths) {
+    assert.equal(
+      fs.existsSync(path.join(path.dirname(manifestPath), iconPath)),
+      true,
+      `Missing extension icon declared in manifest: ${iconPath}`,
+    );
+  }
+});
+
+test('DeepSeek stream parser treats SEARCH fragments as assistant output', () => {
+  const rebuilt = serverInternals.rebuildFragmentText([
+    { type: 'SEARCH', content: 'The official Reuters website is ' },
+    { type: 'SEARCH', content: 'https://www.reuters.com/.' },
+  ]);
+
+  assert.equal(rebuilt.responseText, 'The official Reuters website is https://www.reuters.com/.');
+  assert.equal(rebuilt.thinkText, '');
+});
+
+test('DeepSeek stream parser applies response-level fragment append patches', () => {
+  const fragments = [];
+  const appendFragments = (value) => {
+    const incoming = Array.isArray(value) ? value : [value];
+    for (const fragment of incoming) fragments.push({ ...fragment });
+  };
+
+  const applied = serverInternals.applyResponsePatchOperations([
+    { p: 'fragments', o: 'APPEND', v: [{ type: 'RESPONSE', content: 'The' }] },
+    { p: 'has_pending_fragment', o: 'SET', v: false },
+  ], appendFragments);
+
+  assert.equal(applied, true);
+  assert.deepEqual(fragments, [{ type: 'RESPONSE', content: 'The' }]);
+  assert.equal(serverInternals.rebuildFragmentText(fragments).responseText, 'The');
+});
+
+test('DeepSeek stream parser does not treat service content chunks as model errors', () => {
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ content: 'Official Reuters website URL' }), false);
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ finish_reason: 'stop' }), false);
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
+});
+
+test('consumed upstream HTTP errors retain status, type, and retry hints', () => {
+  const limited = serverInternals.createUpstreamHttpError(429, '  Rate limited\ntry later  ', '12');
+  assert.equal(limited.status, 429);
+  assert.equal(limited.type, 'rate_limit_error');
+  assert.equal(limited.retryAfter, '12');
+  assert.match(limited.message, /Rate limited try later/);
+
+  const unauthorized = serverInternals.createUpstreamHttpError(401, 'expired');
+  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.type, 'authentication_error');
+});
+
+test('sweepIdleSessions evicts only idle entries', () => {
+  serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
+  serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
+  serverInternals.sweepIdleSessions(60 * 1000);
+  assert.equal(serverInternals.sessions.has('stale-x'), false);
+  assert.equal(serverInternals.sessions.has('fresh-x'), true);
+  serverInternals.sessions.delete('fresh-x');
+});
+
+test('proxy API key authentication is optional and uses exact bearer tokens', () => {
+  assert.equal(serverInternals.isProxyAuthorized(undefined, ''), true);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer secret', 'secret'), true);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer wrong', 'secret'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Basic secret', 'secret'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer secret ', 'secret'), false);
+  // Anthropic SDKs send the key as x-api-key.
+  assert.equal(serverInternals.isProxyAuthorized(undefined, 'secret', 'secret'), true);
+  assert.equal(serverInternals.isProxyAuthorized(undefined, 'secret', 'wrong'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer wrong', 'secret', 'secret'), true);
+});
+
+test('proxy API key can be loaded from a mounted secret and required explicitly', () => {
+  const dir = tmpdir();
+  const secretPath = path.join(dir, 'proxy-api-key');
+  fs.writeFileSync(secretPath, 'mounted-secret\n');
+
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY_FILE: secretPath }), 'mounted-secret');
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY: 'env-secret', PROXY_API_KEY_FILE: secretPath }), 'env-secret');
+  assert.equal(serverInternals.loadProxyApiKey({ PROXY_API_KEY_FILE: path.join(dir, 'missing') }), '');
+  assert.doesNotThrow(() => serverInternals.requireProxyApiKey('mounted-secret', true));
+  assert.throws(
+    () => serverInternals.requireProxyApiKey('', true),
+    /PROXY_API_KEY is required/,
+  );
+});
+
+test('Containerfile keeps the rootless Podman runtime minimal and fail-closed', () => {
+  const containerfile = fs.readFileSync(path.join(ROOT, 'Containerfile'), 'utf8');
+  const containerignore = fs.readFileSync(path.join(ROOT, '.containerignore'), 'utf8');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const copyLines = containerfile
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith('COPY '));
+
+  assert.deepEqual(copyLines, [
+    'COPY --chown=1000:1000 package.json server.js ./',
+    'COPY --chown=1000:1000 lib/pow.js lib/env.js ./lib/',
+  ]);
+  assert.doesNotMatch(containerfile, /^\s*(?:COPY|ADD)\s+\.\s/m);
+  assert.match(containerfile, /^USER 1000:1000$/m);
+  assert.match(containerfile, /HOST=0\.0\.0\.0/);
+  assert.match(containerfile, /NON_INTERACTIVE=1/);
+  assert.match(containerfile, /REQUIRE_PROXY_API_KEY=1/);
+  assert.match(containerfile, /PROXY_API_KEY_FILE=\/run\/secrets\/proxy-api-key/);
+  assert.match(containerfile, /^HEALTHCHECK /m);
+  assert.match(containerfile, /path:'\/health'/);
+  assert.match(containerfile, /^CMD \["node", "server\.js"\]$/m);
+
+  assert.match(containerignore, /^\*$/m);
+  assert.doesNotMatch(containerignore, /^!.*(?:auth|secret|\.env)/mi);
+  assert.match(readme, /--publish 127\.0\.0\.1:9655:9655/);
+  assert.match(readme, /--secret free-deepseek-auth[^\n]*mode=0400/);
+  assert.match(readme, /--secret free-deepseek-proxy-key[^\n]*mode=0400/);
+  assert.match(readme, /--read-only/);
+  assert.match(readme, /--cap-drop=ALL/);
+  assert.match(readme, /--security-opt=no-new-privileges/);
+});
+
+test('loopback host detection covers supported local bind addresses', () => {
+  assert.equal(serverInternals.isLoopbackHost('127.0.0.1'), true);
+  assert.equal(serverInternals.isLoopbackHost('::1'), true);
+  assert.equal(serverInternals.isLoopbackHost('[::1]'), true);
+  assert.equal(serverInternals.isLoopbackHost('::ffff:127.0.0.1'), true);
+  assert.equal(serverInternals.isLoopbackHost('localhost'), true);
+  assert.equal(serverInternals.isLoopbackHost('0.0.0.0'), false);
+});
+
+test('browser origin guard allows local UIs and exact configured origins only', () => {
+  const allowed = new Set(['https://ui.example.com', 'chrome-extension://trusted-id']);
+  assert.equal(serverInternals.isBrowserOriginAllowed(undefined, allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://localhost:3000', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://127.0.0.1:8080', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://[::1]:3000', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('https://ui.example.com/path', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('chrome-extension://trusted-id', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('https://evil.example', allowed), false);
+  assert.equal(serverInternals.isBrowserOriginAllowed('chrome-extension://other-id', allowed), false);
+  assert.equal(serverInternals.isBrowserOriginAllowed('null', allowed), false);
+});
+
+test('parseToolCall converts canonical DeepSeek DSML into an OpenAI tool call', () => {
+  const dsml = [
+    'I will inspect it.',
+    '<｜DSML｜tool_calls>',
+    '<｜DSML｜invoke name="execute_code">',
+    '<｜DSML｜parameter name="code" string="true">print("ok")</｜DSML｜parameter>',
+    '<｜DSML｜parameter name="timeout" string="false">30</｜DSML｜parameter>',
+    '<｜DSML｜parameter name="capture" string="false">true</｜DSML｜parameter>',
+    '</｜DSML｜invoke>',
+    '</｜DSML｜tool_calls>',
+  ].join('\n');
+
+  const call = serverInternals.parseToolCall(dsml);
+  assert.equal(call.name, 'execute_code');
+  assert.deepEqual(JSON.parse(call.arguments), {
+    code: 'print("ok")',
+    timeout: 30,
+    capture: true,
+  });
+});
+
+test('parseToolCall accepts the doubled-bar DSML Web variant from issue #19', () => {
+  const dsml = [
+    '<｜｜DSML｜｜ Tool Calls>',
+    '<｜｜DSML｜｜ name="web_search">{"query":"DeepSeek DSML"}',
+    '</｜｜DSML｜｜ Tool Calls>',
+  ].join('\n');
+
+  const call = serverInternals.parseToolCall(dsml);
+  assert.equal(call.name, 'web_search');
+  assert.deepEqual(JSON.parse(call.arguments), { query: 'DeepSeek DSML' });
+});
+
+test('parseToolCall accepts zero-argument, CDATA, legacy, collapsed, and prefixed wrappers', () => {
+  const zeroArg = serverInternals.parseToolCall(
+    '<|DSML|tool_calls><|DSML|invoke name="ping"></|DSML|invoke></|DSML|tool_calls>'
+  );
+  assert.deepEqual(zeroArg, { name: 'ping', arguments: '{}' });
+
+  const cdata = serverInternals.parseToolCall(
+    '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[line 1\n<line 2>\n</parameter>\n</invoke>\n</tool_calls>]]></parameter></invoke></tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(cdata.arguments), { content: 'line 1\n<line 2>\n</parameter>\n</invoke>\n</tool_calls>' });
+
+  const collapsed = serverInternals.parseToolCall(
+    '<DSMLtool_calls><DSMLinvoke name="read_file"><DSMLparameter name="path">/tmp/a</DSMLparameter></DSMLinvoke></DSMLtool_calls>'
+  );
+  assert.deepEqual(JSON.parse(collapsed.arguments), { path: '/tmp/a' });
+
+  const prefixed = serverInternals.parseToolCall(
+    '<abc:tool_calls><abc:invoke name="read_file"><abc:parameter name="path">/tmp/b</abc:parameter></abc:invoke></abc:tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(prefixed.arguments), { path: '/tmp/b' });
+});
+
+test('parseToolCall normalizes fullwidth delimiters and narrowly repairs a missing opening wrapper', () => {
+  const fullwidth = serverInternals.parseToolCall(
+    '＜｜DSML｜Tool Calls＞＜｜DSML｜Invoke name=“read_file”＞＜｜DSML｜Parameter name=“path”＞/tmp/c＜/｜DSML｜Parameter＞＜/｜DSML｜Invoke＞＜/｜DSML｜Tool Calls＞'
+  );
+  assert.deepEqual(JSON.parse(fullwidth.arguments), { path: '/tmp/c' });
+
+  const repaired = serverInternals.parseToolCall(
+    '<invoke name="read_file"><parameter name="path">/tmp/d</parameter></invoke></tool_calls>'
+  );
+  assert.deepEqual(JSON.parse(repaired.arguments), { path: '/tmp/d' });
+});
+
+test('parseToolCall rejects bare invokes and bare JSON examples', () => {
+  const bareInvoke = '<|DSML|invoke name="execute_code"><|DSML|parameter name="code">danger()</|DSML|parameter></|DSML|invoke>';
+  assert.equal(serverInternals.parseToolCall(bareInvoke), null);
+  assert.equal(serverInternals.looksLikeToolCallMarkup(bareInvoke), true);
+
+  const prose = 'For example return {"name":"execute_code","arguments":{"code":"danger()"}} when appropriate.';
+  assert.equal(serverInternals.parseToolCall(prose), null);
+  assert.equal(serverInternals.parseToolCall('```json\n{"name":"execute_code","arguments":{"code":"danger()"}}\n```'), null);
+});
+
+test('parseToolCall accepts only explicit JSON envelopes with valid object arguments', () => {
+  const explicit = serverInternals.parseToolCall(
+    'Use this: {"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}'
+  );
+  assert.deepEqual(JSON.parse(explicit.arguments), { path: '/tmp/a' });
+
+  const openai = serverInternals.parseToolCall(JSON.stringify({
+    tool_calls: [{
+      type: 'function',
+      function: { name: 'read_file', arguments: JSON.stringify({ path: '/tmp/b' }) },
+    }],
+  }));
+  assert.deepEqual(JSON.parse(openai.arguments), { path: '/tmp/b' });
+
+  assert.equal(serverInternals.parseToolCall('{"tool_call":{"name":"read_file","arguments":"not-json"}}'), null);
+  assert.equal(serverInternals.parseToolCall(JSON.stringify({
+    tool_calls: [
+      { function: { name: 'read_file', arguments: '{}' } },
+      { function: { name: 'write_file', arguments: '{}' } },
+    ],
+  })), null);
+});
+
+test('parseToolCall bounds tool markup and scans unmatched braces in linear time', () => {
+  const oversized = `<|DSML|tool_calls>${'x'.repeat(256 * 1024)}</|DSML|tool_calls>`;
+  assert.equal(serverInternals.parseToolCall(oversized), null);
+
+  const started = Date.now();
+  assert.equal(serverInternals.parseToolCall('{'.repeat(64 * 1024)), null);
+  assert.ok(Date.now() - started < 1000, 'unmatched JSON braces should not block the event loop');
+
+  const malformedTagStarted = Date.now();
+  const malformedTags = `<tool_calls><invoke name="${'<invoke name="'.repeat(16000)}</tool_calls>`;
+  assert.equal(serverInternals.parseToolCall(malformedTags), null);
+  assert.ok(Date.now() - malformedTagStarted < 1000, 'malformed quoted DSML tags should be rejected in bounded time');
+});
+
+test('parseToolCall refuses incomplete DSML instead of executing JSON found inside it', () => {
+  const malformed = [
+    '<｜DSML｜tool_calls>',
+    '<｜DSML｜invoke name="execute_code">',
+    '{"name":"dangerous_fallback","code":"rm -rf /"}',
+    '</｜DSML｜tool_calls>',
+  ].join('\n');
+
+  assert.equal(serverInternals.parseToolCall(malformed), null);
+  assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true);
+});
+
+test('parseToolCall rejects partially consumed DSML parameters and wrapper scope', () => {
+  const truncatedSecondParameter = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter><parameter name="content">truncated</invoke></tool_calls>';
+  const trailingInvokeJunk = '<tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter>GARBAGE</invoke></tool_calls>';
+  const truncatedSecondInvoke = '<tool_calls><invoke name="ping"></invoke><invoke name="write_file"><parameter name="path">/tmp/a</tool_calls>';
+  const twoCompleteInvokes = '<tool_calls><invoke name="ping"></invoke><invoke name="ping"></invoke></tool_calls>';
+  const secondInvokeOutsideWrapper = '<tool_calls><invoke name="ping"></invoke></tool_calls><invoke name="write_file"><parameter name="path">/tmp/a</parameter></invoke>';
+  const trailingWrapperJunk = '<tool_calls><invoke name="ping"></invoke>GARBAGE</tool_calls>';
+  const unclosedCdata = '<tool_calls><invoke name="write_file"><parameter name="content"><![CDATA[truncated</parameter></invoke></tool_calls>';
+  const tooManyParameters = `<tool_calls><invoke name="write_file">${Array.from({ length: 129 }, (_, i) => `<parameter name="p${i}">${i}</parameter>`).join('')}</invoke></tool_calls>`;
+
+  for (const malformed of [
+    truncatedSecondParameter,
+    trailingInvokeJunk,
+    truncatedSecondInvoke,
+    twoCompleteInvokes,
+    secondInvokeOutsideWrapper,
+    trailingWrapperJunk,
+    unclosedCdata,
+    tooManyParameters,
+  ]) {
+    assert.equal(serverInternals.parseToolCall(malformed), null, malformed);
+    assert.equal(serverInternals.looksLikeToolCallMarkup(malformed), true, malformed);
+  }
+});
+
+test('tool schema compaction drops prose annotations but preserves validation shape', () => {
+  const compact = serverInternals.compactToolSchema({
+    type: 'object',
+    description: 'large top-level description',
+    properties: {
+      command: { type: 'string', description: 'large property description' },
+      count: { type: 'integer', minimum: 1 },
+      description: { type: 'string', description: 'annotation, not the property name' },
+      title: { type: 'boolean', title: 'annotation, not the property name' },
+      nested: {
+        anyOf: [
+          { type: 'string', description: 'remove from array item one' },
+          { type: 'integer', title: 'remove from array item two' },
+        ],
+      },
+    },
+    required: ['command', 'description', 'title'],
+  });
+
+  assert.deepEqual(compact, {
+    type: 'object',
+    properties: {
+      command: { type: 'string' },
+      count: { type: 'integer', minimum: 1 },
+      description: { type: 'string' },
+      title: { type: 'boolean' },
+      nested: { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    },
+    required: ['command', 'description', 'title'],
+  });
+});
+
+test('tool schema compaction preserves literal const, enum, and default values', () => {
+  const literals = {
+    type: 'object',
+    description: 'drop this annotation',
+    const: { description: 'literal field', title: 'literal title', nested: { examples: ['literal'] } },
+    enum: [
+      { description: 'first', value: 1 },
+      { title: 'second', value: 2 },
+    ],
+    default: { description: 'default literal', title: 'default title' },
+    properties: {
+      choice: {
+        description: 'drop nested annotation',
+        const: { description: 'required argument value', title: 'keep me' },
+      },
+    },
+  };
+
+  assert.deepEqual(serverInternals.compactToolSchema(literals), {
+    type: 'object',
+    const: literals.const,
+    enum: literals.enum,
+    default: literals.default,
+    properties: {
+      choice: { const: literals.properties.choice.const },
+    },
+  });
+});
+
+test('buildBoundedPrompt preserves task edges and drops duplicate recovery history', () => {
+  const system = `SYSTEM_START\n${'s'.repeat(50000)}\nTOOL_ADAPTER_END`;
+  const history = `[Previous conversation]\n${'h'.repeat(10000)}\n`;
+  const conversation = `TASK_START\n${'c'.repeat(70000)}\nLATEST_TOOL_RESULT`;
+  const bounded = serverInternals.buildBoundedPrompt(system, history, conversation, 20000);
+
+  assert.equal(bounded.compacted, true);
+  assert.equal(bounded.historyDropped, true);
+  assert.ok(bounded.prompt.length <= 20000);
+  assert.match(bounded.prompt, /SYSTEM_START/);
+  assert.match(bounded.prompt, /TOOL_ADAPTER_END/);
+  assert.match(bounded.prompt, /TASK_START/);
+  assert.match(bounded.prompt, /LATEST_TOOL_RESULT/);
+  assert.doesNotMatch(bounded.prompt, /Previous conversation/);
+});
+
+test('client-provided multi-turn history suppresses server recovery-history injection', () => {
+  assert.equal(serverInternals.hasExplicitConversationHistory([
+    { role: 'system', content: 'rules' },
+    { role: 'user', content: 'hello' },
+  ]), false);
+  assert.equal(serverInternals.hasExplicitConversationHistory([
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'tool', content: 'result' },
+  ]), true);
+});
+
+test('context-too-long detector recognizes DeepSeek localized errors', () => {
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Содержание слишком длинное. Сократите его и попробуйте снова.' }), true);
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Maximum context length exceeded' }), true);
+  assert.equal(serverInternals.isContextTooLongError({ content: 'Temporary backend overload' }), false);
+});
+
+test('empty-response retry keeps recovery history unless a smaller global cap requires compaction', () => {
+  const system = 'SYSTEM';
+  const history = '[Previous conversation]\nUser: old\nAssistant: answer\n\n[Continue from here]\n\n';
+  const conversation = 'User: follow up';
+  const initial = serverInternals.buildBoundedPrompt(system, history, conversation, 5000);
+  const unchangedRetry = serverInternals.buildRetryPrompt(system, history, conversation, initial.prompt, 4000);
+
+  assert.equal(unchangedRetry.compacted, false);
+  assert.match(unchangedRetry.prompt, /Previous conversation/);
+  assert.match(unchangedRetry.prompt, /Assistant: answer/);
+
+  const largeConversation = `TASK_START\n${'x'.repeat(9000)}\nLATEST_RESULT`;
+  const largeInitial = serverInternals.buildBoundedPrompt(system, history, largeConversation, 8000);
+  const smallerRetry = serverInternals.buildRetryPrompt(system, history, largeConversation, largeInitial.prompt, 4000);
+  assert.equal(smallerRetry.compacted, true);
+  assert.ok(smallerRetry.prompt.length <= 4000);
+  assert.match(smallerRetry.prompt, /TASK_START/);
+  assert.match(smallerRetry.prompt, /LATEST_RESULT/);
+});
+
+test('fresh-session retry restores local history that a healthy remote session initially omitted', () => {
+  const system = 'SYSTEM';
+  const history = serverInternals.buildRecoveryHistoryPrefix([
+    { user: 'original task', assistant: 'original answer' },
+  ]);
+  const conversation = 'User: follow up';
+  const establishedSessionPrompt = serverInternals.buildBoundedPrompt(system, '', conversation, 5000).prompt;
+  const freshSessionRetry = serverInternals.buildRetryPrompt(
+    system,
+    history,
+    conversation,
+    establishedSessionPrompt,
+    5000,
+  );
+
+  assert.ok(freshSessionRetry.prompt.length > establishedSessionPrompt.length);
+  assert.match(freshSessionRetry.prompt, /Previous conversation/);
+  assert.match(freshSessionRetry.prompt, /original task/);
+  assert.match(freshSessionRetry.prompt, /original answer/);
+  assert.match(freshSessionRetry.prompt, /follow up/);
+});
+
+test('remote reset preserves local history and sticky account while returning failure diagnostics', () => {
+  const session = serverInternals.createSession();
+  session.id = 'failed-session';
+  session.parentMessageId = 'parent';
+  session.createdAt = 123;
+  session.messageCount = 17;
+  session.accountId = 'account_2';
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  const failure = serverInternals.resetRemoteSession(session);
+  assert.deepEqual(failure, {
+    failedSessionId: 'failed-session',
+    failedMessageCount: 17,
+    accountId: 'account_2',
+  });
+  assert.equal(session.id, null);
+  assert.equal(session.parentMessageId, null);
+  assert.equal(session.createdAt, null);
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.accountId, 'account_2');
+  assert.equal(session.history.length, 1);
+});
+
+test('account rotation clears a foreign remote session and preserves local recovery history', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+  });
+
+  serverInternals.accounts.push(
+    {
+      id: 'cooling',
+      config: { token: 'one', cookie: 'one' },
+      cooldownUntil: Date.now() + 60_000,
+      headers: {},
+    },
+    {
+      id: 'ready',
+      config: { token: 'two', cookie: 'two' },
+      cooldownUntil: 0,
+      headers: {},
+    },
+  );
+  const session = serverInternals.createSession();
+  session.id = 'foreign-session';
+  session.parentMessageId = 'foreign-parent';
+  session.accountId = 'cooling';
+  session.messageCount = 7;
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  const selected = serverInternals.selectAccountForSession(session);
+  assert.equal(selected.id, 'ready');
+  assert.equal(session.accountId, 'ready');
+  assert.equal(session.id, null);
+  assert.equal(session.parentMessageId, null);
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.history.length, 1);
+});
+
+test('cross-account continuation is accepted only with a fresh recovery prompt', () => {
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'one' },
+    freshSessionReset: false,
+  }), true);
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'two' },
+    freshSessionReset: true,
+  }), true);
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'two' },
+    freshSessionReset: false,
+  }), false);
+});
+
+test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
+  const depthSession = serverInternals.createSession();
+  depthSession.id = 'deep-session';
+  depthSession.messageCount = 100;
+  depthSession.accountId = 'account_1';
+  depthSession.history.push({ user: 'u', assistant: 'a' });
+  const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now());
+  assert.equal(depthReset.reason, 'max_message_depth');
+  assert.equal(depthSession.id, null);
+  assert.equal(depthSession.history.length, 1);
+  assert.equal(depthSession.accountId, 'account_1');
+
+  const now = Date.now();
+  const ttlSession = serverInternals.createSession();
+  ttlSession.id = 'old-session';
+  ttlSession.createdAt = now - (2 * 60 * 60 * 1000) - 1;
+  const ttlReset = serverInternals.prepareSessionForPrompt(ttlSession, now);
+  assert.equal(ttlReset.reason, 'session_ttl');
+  assert.equal(ttlReset.failedSessionId, 'old-session');
+});
+
+test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {
+  const toolResult = `RESULT_START\n${'z'.repeat(12000)}\nRESULT_END`;
+  const formatted = serverInternals.formatMessages([
+    { role: 'user', content: 'inspect this' },
+    { role: 'tool', content: toolResult },
+  ], []);
+
+  assert.match(formatted.prompt, /RESULT_START/);
+  assert.match(formatted.prompt, /RESULT_END/);
+  assert.ok(formatted.prompt.length > 12000);
+
+  const bounded = serverInternals.buildBoundedPrompt(formatted.systemPrompt, '', formatted.prompt, 5000);
+  assert.equal(bounded.compacted, true);
+  assert.ok(bounded.prompt.length <= 5000);
+  assert.match(bounded.prompt, /RESULT_END/);
+});
+
+test('retry state clears a stale finish reason and failure classes use protocol-appropriate status codes', () => {
+  const retry = serverInternals.normalizeRetryResponse({ content: 'recovered', finishReason: null });
+  assert.equal(retry.finishReason, null);
+
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure({ content: 'Maximum context length exceeded' }, false),
+    { status: 400, type: 'context_length_exceeded' },
+  );
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure(null, true),
+    { status: 504, type: 'request_timeout' },
+  );
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure(null, false),
+    { status: 502, type: 'empty_response' },
+  );
+  assert.equal(serverInternals.isTimeoutError({ name: 'TimeoutError', message: 'operation timed out' }), true);
+  assert.equal(serverInternals.isTimeoutError(new Error('ordinary upstream error')), false);
+});
+
+test('context-compaction header is marked and exposed to browser clients', () => {
+  const headers = new Map();
+  const response = { setHeader: (name, value) => headers.set(name, value) };
+  serverInternals.setCorsResponseHeaders(response);
+  serverInternals.markContextCompacted(response);
+
+  assert.equal(headers.get('Access-Control-Expose-Headers'), serverInternals.CONTEXT_COMPACTED_HEADER);
+  assert.equal(headers.get(serverInternals.CONTEXT_COMPACTED_HEADER), 'true');
+});
+
+test('stream helpers preserve the request-level exact CORS origin', () => {
+  const response = {
+    id: 'ds-test',
+    created: 1,
+    model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+
+  for (const send of [
+    serverInternals.sendAnthropicStream,
+    serverInternals.sendResponsesStream,
+    serverInternals.sendOpenAIStream,
+  ]) {
+    let writeHeadHeaders = null;
+    const res = {
+      writeHead: (_status, headers) => { writeHeadHeaders = headers; },
+      write: () => {},
+      end: () => {},
+    };
+    send(res, response);
+    assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
+  }
+});
+
+test('parseToolCall repairs raw Windows backslashes and newlines inside JSON strings (#30)', () => {
+  const issue30 = '{"tool_call":{"name":"read_files","arguments":{"files":[{"path":"c:\\git\\dsh-local-llm\\src\\index.ts","start_line":240,"end_line":350},{"path":"c:\\git\\dsh-local-llm\\src\\server-manager.ts"}]}}}';
+  const call = serverInternals.parseToolCall(issue30);
+  assert.equal(call.name, 'read_files');
+  assert.deepEqual(JSON.parse(call.arguments).files.map(f => f.path), [
+    'c:\\git\\dsh-local-llm\\src\\index.ts',
+    'c:\\git\\dsh-local-llm\\src\\server-manager.ts',
+  ]);
+
+  // A raw path whose segments happen to look like \n and \t stays literal.
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\new\\tmp\\x"}'), { p: 'C:\\new\\tmp\\x' });
+  // Correctly escaped JSON is never changed.
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"a\\nb","q":"C:\\\\dir"}'), { p: 'a\nb', q: 'C:\\dir' });
+
+  const legacy = serverInternals.parseToolCall('TOOL_CALL: read_file\narguments: {"path":"D:\\Projects\\app\\main.cs"}');
+  assert.deepEqual(JSON.parse(legacy.arguments), { path: 'D:\\Projects\\app\\main.cs' });
+
+  const multiline = serverInternals.parseToolCall('{"tool_call":{"name":"write_file","arguments":{"path":"/tmp/a.py","content":"def f():\n\treturn 1\n"}}}');
+  assert.deepEqual(JSON.parse(multiline.arguments), { path: '/tmp/a.py', content: 'def f():\n\treturn 1\n' });
+});
+
+test('parseToolCall ignores source-code fences and finds an envelope after them (#30)', () => {
+  const code = Array.from({ length: 40 }, (_, i) => `public void M${i}() { if (x) { y(); } }`).join('\n');
+  const answer = `Here is the class:\n\`\`\`csharp\n${code}\n\`\`\`\n{"tool_call":{"name":"write_file","arguments":{"path":"/tmp/A.cs","content":"class A {}"}}}`;
+  const call = serverInternals.parseToolCall(answer);
+  assert.equal(call.name, 'write_file');
+  assert.equal(serverInternals.parseToolCall(`\`\`\`csharp\n${code}\n\`\`\``), null);
+
+  const fenced = serverInternals.parseToolCall('```json\n{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/x"}}}\n```');
+  assert.deepEqual(JSON.parse(fenced.arguments), { path: '/tmp/x' });
+});
+
+test('sanitizeContent keeps emoji and drops only lone surrogates', () => {
+  assert.equal(serverInternals.sanitizeContent('ok 😀 ✅'), 'ok 😀 ✅');
+  assert.equal(serverInternals.sanitizeContent('a\ud800b\udc00c'), 'abc');
+});
+
+test('message normalization omits inline images and earlier reasoning blocks', () => {
+  const base64 = 'data:image/png;base64,' + 'A'.repeat(200000);
+  const text = serverInternals.normalizeMessageContent([
+    { type: 'text', text: 'look' },
+    { type: 'image_url', image_url: { url: base64 } },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'B'.repeat(1000) } },
+    { type: 'thinking', thinking: 'secret', signature: 'sig' },
+    { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+  ]);
+  assert.ok(text.length < 300, text);
+  assert.match(text, /look/);
+  assert.match(text, serverInternals.imageUploadEnabled()
+    ? /\[Image [0-9a-f]{12} attached\]/
+    : /\[Image attached; not visible through this proxy\]/);
+  assert.match(text, /\[Image: https:\/\/example\.com\/cat\.png\]/);
+  assert.doesNotMatch(text, /secret|sig/);
+});
+
+test('conversation formatting replays tool calls in the requested JSON format', () => {
+  const formatted = serverInternals.formatMessages([
+    { role: 'developer', content: 'DEV RULES' },
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/a"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: 'data' }] },
+  ], []);
+  assert.match(formatted.systemPrompt, /DEV RULES/);
+  assert.match(formatted.prompt, /Assistant: \{"tool_call":\{"name":"read_file","arguments":\{"path":"\/a"\}\}\}/);
+  assert.match(formatted.prompt, /\[Tool Result: read_file\]\ndata/);
+  assert.doesNotMatch(formatted.prompt, /TOOL_CALL:/);
+});
+
+test('Responses API input keeps earlier function calls in the transcript', () => {
+  const params = serverInternals.normalizeApiParams({
+    model: 'deepseek-chat',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'list' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'ls', arguments: '{"dir":"/"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'bin etc' },
+    ],
+  }, 'responses');
+  const formatted = serverInternals.formatMessages(params.messages, []);
+  assert.match(formatted.prompt, /Assistant: \{"tool_call":\{"name":"ls"/);
+  assert.match(formatted.prompt, /\[Tool Result: ls\]\nbin etc/);
+});
+
+test('planSessionTurn sends deltas only for an exact continuation of the tracked history', () => {
+  const messages = [
+    { role: 'system', content: 'S' },
+    { role: 'user', content: 'task' },
+    { role: 'assistant', content: 'calling', tool_calls: [{ id: 'c1', function: { name: 'ls', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'out' },
+  ];
+  const session = serverInternals.createSession();
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full');
+
+  session.id = 'chat';
+  session.contextKey = 'ctx';
+  session.sentMessageKeys = [serverInternals.conversationMessageKey(messages[1])];
+  const delta = serverInternals.planSessionTurn(session, messages, 'ctx');
+  assert.equal(delta.mode, 'delta');
+  assert.deepEqual(delta.messages.map(m => m.role), ['tool']);
+  assert.equal(delta.keys.length, 3);
+
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'other-system-prompt').mode, 'full');
+  session.sentMessageKeys = ['something else'];
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full');
+  session.sentMessageKeys = delta.keys;
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full', 'a replayed request has no new input');
+
+  const deltaPrompt = serverInternals.buildDeltaPrompt(delta.messages, messages, serverInternals.formatToolReminder([{ type: 'function', function: { name: 'ls' } }]));
+  assert.match(deltaPrompt.prompt, /^\[Tool Result: ls\]\nout\n\n\[Tool reminder\] Available tools: ls\./);
+});
+
+test('remote sessions roll over once their accumulated context gets too large', () => {
+  const session = serverInternals.createSession();
+  session.id = 'big-chat';
+  session.sentMessageKeys = ['k'];
+  session.remoteChars = 10 * 1000 * 1000;
+  const reset = serverInternals.prepareSessionForPrompt(session, Date.now());
+  assert.equal(reset.reason, 'max_context_chars');
+  assert.equal(session.id, null);
+  assert.deepEqual(session.sentMessageKeys, []);
+  assert.equal(session.remoteChars, 0);
+});
+
+test('every supported model alias targets the unified DeepSeek Web mode (#31)', () => {
+  for (const id of serverInternals.SUPPORTED_MODEL_IDS) {
+    assert.equal(serverInternals.MODEL_CONFIGS[id].model_type, 'default', id);
+  }
+  assert.equal(serverInternals.resolveModelConfig('deepseek-expert').thinking_enabled, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-v4-pro').thinking_enabled, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-v4-flash').thinking_enabled, false);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-expert-search').supported, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-vision').supported, serverInternals.imageUploadEnabled());
+});
+
+test('image uploads default on and retain the explicit zero opt-out', () => {
+  assert.equal(serverInternals.imageUploadEnabled({}), true);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: '1' }), true);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: '0' }), false);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: 'false' }), false, 'existing false-like opt-outs remain disabled');
+
+  // Check the flag at module initialization, including its actual model and
+  // message-normalization behavior, rather than only the parsing helper.
+  for (const enabled of [true, false]) {
+    const result = runNode(['-e', `
+      if (${enabled}) delete process.env.DEEPSEEK_IMAGE_UPLOAD;
+      else process.env.DEEPSEEK_IMAGE_UPLOAD = '0';
+      const api = require('./server.js').__test;
+      const text = api.normalizeMessageContent([{ type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } }]);
+      console.log(JSON.stringify({ supported: api.resolveModelConfig('deepseek-vision').supported, text }));
+    `]);
+    assert.equal(result.status, 0, result.stderr);
+    const actual = JSON.parse(result.stdout);
+    assert.equal(actual.supported, enabled);
+    assert.match(actual.text, enabled ? /\[Image [0-9a-f]{12} attached\]/ : /not visible through this proxy/);
+    assert.doesNotMatch(actual.text, /base64|QUJD/);
+  }
+});
+
+test('rate-limit detector recognizes DeepSeek throttling messages', () => {
+  assert.equal(serverInternals.isRateLimitError({ content: 'Too many messages in a short period' }), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Слишком частые сообщения. Повторите попытку позже.' }), true);
+  assert.equal(serverInternals.isRateLimitError('rate_limit_reached'), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Повторите попытку позже: сервер обновляется.' }), false);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Содержание слишком длинное' }), false);
+  assert.deepEqual(serverInternals.classifyRecoveryFailure({ content: 'Too many messages' }, false), { status: 429, type: 'rate_limit_error' });
+  assert.deepEqual(serverInternals.classifyRecoveryFailure({ content: 'Слишком частые сообщения. Повторите попытку позже.' }, false), { status: 429, type: 'rate_limit_error' });
+});
+
+test('.env loader fills only unset variables', () => {
+  const dir = tmpdir();
+  const file = path.join(dir, '.env');
+  fs.writeFileSync(file, '# comment\nPORT=1234\nexport HOST="0.0.0.0"\nKEEP=from-file # trailing comment\nEMPTY=\n');
+  const env = { PORT: '9655' };
+  assert.equal(serverInternals.loadDotEnv(file, env), 3);
+  assert.deepEqual(env, { PORT: '9655', HOST: '0.0.0.0', KEEP: 'from-file', EMPTY: '' });
+  assert.equal(serverInternals.loadDotEnv(path.join(dir, 'missing'), env), 0);
+});
+
+test('screenshot extraction handles array content and only scans the current turn', () => {
+  const dir = tmpdir();
+  const oldShot = path.join(dir, 'old.png');
+  const newShot = path.join(dir, 'new.png');
+  fs.writeFileSync(oldShot, 'x');
+  fs.writeFileSync(newShot, 'x');
+  const paths = serverInternals.extractScreenshotPaths([
+    { role: 'user', content: 'first' },
+    { role: 'tool', content: JSON.stringify({ screenshot_path: oldShot }) },
+    { role: 'user', content: [{ type: 'text', text: 'second' }] },
+    { role: 'tool', content: [{ type: 'text', text: JSON.stringify({ screenshot_path: newShot }) }] },
+  ]);
+  assert.deepEqual(paths, [`MEDIA:${newShot}`]);
+});
+
+test('envelopes nested in other JSON or in foreign code fences are never executed', () => {
+  const nested = 'log {"event": {"tool_call": {"name":"terminal","arguments":{"command":"rm -rf ~/build"}}}}';
+  assert.equal(serverInternals.parseToolCall(nested), null);
+  const jsFence = 'Example:\n```javascript\nconst x = {"tool_call":{"name":"terminal","arguments":{"command":"git push --force"}}};\n```';
+  assert.equal(serverInternals.parseToolCall(jsFence), null);
+  const pyFence = '```python\nTOOL_CALL: terminal\narguments: {"command":"rm -rf /"}\n```';
+  assert.equal(serverInternals.parseToolCall(pyFence), null);
+});
+
+test('lenient repair keeps unambiguous escapes when other backslashes are raw', () => {
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\\\Users\\me"}'), { p: 'C:\\Users\\me' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"caf\\u00e9 \\d"}'), { p: 'café \\d' });
+});
+
+test('stream helpers never split emoji into lone surrogates', () => {
+  const content = 'x'.repeat(49) + '😀' + 'y'.repeat(79) + '🎉 done';
+  const response = {
+    id: 'ds-test', created: 1, model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content, reasoning_content: content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+  for (const send of [serverInternals.sendOpenAIStream, serverInternals.sendAnthropicStream, serverInternals.sendResponsesStream]) {
+    let out = '';
+    send({ writeHead: () => {}, write: chunk => { out += chunk; }, end: () => {} }, response);
+    for (const line of out.split('\n').filter(l => l.startsWith('data: {'))) {
+      const decoded = JSON.stringify(JSON.parse(line.slice(6)));
+      assert.doesNotMatch(decoded, /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i);
+      const parsed = JSON.parse(line.slice(6));
+      const texts = JSON.stringify(parsed).match(/"(?:content|text|delta|reasoning_content)":"([^"]*)"/g) || [];
+      for (const t of texts) assert.equal(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(JSON.parse(`{${t}}`)[t.split('"')[1]]), false, t);
+    }
+  }
+});
+
+test('planSessionTurn sends system prompt changes along for latest-only clients', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat';
+  session.contextKey = 'old';
+  session.sentMessageKeys = ['k'];
+  const plan = serverInternals.planSessionTurn(session, [{ role: 'system', content: 'new' }, { role: 'user', content: 'hi' }], 'new');
+  assert.equal(plan.mode, 'delta');
+  assert.equal(plan.includeSystem, true);
+  const prompt = serverInternals.buildDeltaPrompt(plan.messages, [], '', 5000, 'NEW SYSTEM');
+  assert.match(prompt.prompt, /^NEW SYSTEM\n\nUser: hi$/);
+});
+
+test('valid-looking Windows paths keep their backslashes', () => {
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\files\\bin\\temp"}'), { p: 'C:\\files\\bin\\temp' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\new\\tmp"}'), { p: 'C:\\new\\tmp' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"line\\nnext\\tcol"}'), { p: 'line\nnext\tcol' });
+});
+
+test('fences: nested quotes, text fences and foreign-language examples', () => {
+  const envelope = '{"tool_call":{"name":"read_file","arguments":{"path":"/x"}}}';
+  assert.equal(serverInternals.parseToolCall(`\`\`\`\`markdown\nExample:\n\`\`\`json\n${envelope}\n\`\`\`\n\`\`\`\``), null);
+  assert.equal(serverInternals.parseToolCall(`\`\`\`text\n${envelope}\n\`\`\``).name, 'read_file');
+  assert.equal(serverInternals.looksLikeToolCallMarkup('```python\nmsg = {"tool_call": {"name": "x"}}\n```'), false);
+  assert.equal(serverInternals.parseToolCall('```xml\n<tool_calls><invoke name="rm"></invoke></tool_calls>\n```'), null);
+});
+
+test('planSessionTurn sends a full prompt into a chat whose first turn failed', () => {
+  const session = serverInternals.createSession();
+  session.id = 'empty-chat';
+  const plan = serverInternals.planSessionTurn(session, [{ role: 'user', content: 'What is my name?' }], 'ctx');
+  assert.equal(plan.mode, 'full');
+});
+
+test('an account cooldown without a ready alternative keeps the sticky chat', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts));
+  serverInternals.accounts.push({ id: 'only', config: { token: 't', cookie: 'c' }, cooldownUntil: Date.now() + 60_000, headers: {} });
+  const session = serverInternals.createSession();
+  session.id = 'kept-chat';
+  session.accountId = 'only';
+  assert.throws(() => serverInternals.selectAccountForSession(session), err => err.status === 429);
+  assert.equal(session.id, 'kept-chat');
+  assert.equal(session.accountId, 'only');
+});
+
+test('systemd unit runs unprivileged, non-interactive and fail-closed', () => {
+  const unit = fs.readFileSync(path.join(ROOT, 'deploy', 'free-deepseek-api.service'), 'utf8');
+  assert.match(unit, /^User=freedeepseek$/m);
+  assert.doesNotMatch(unit, /^User=root$/m);
+  assert.match(unit, /^Environment=NON_INTERACTIVE=1$/m);
+  assert.match(unit, /^Environment=HOST=127\.0\.0\.1$/m);
+  assert.match(unit, /^Environment=REQUIRE_PROXY_API_KEY=1$/m);
+  assert.match(unit, /^Environment=PROXY_API_KEY_FILE=\/etc\/free-deepseek-api\/proxy-api-key$/m);
+  assert.match(unit, /^NoNewPrivileges=true$/m);
+  assert.match(unit, /^ProtectSystem=strict$/m);
+  assert.match(unit, /^Restart=on-failure$/m);
+  // Node's JIT needs writable+executable memory.
+  assert.doesNotMatch(unit, /^MemoryDenyWriteExecute=true$/m);
+});
