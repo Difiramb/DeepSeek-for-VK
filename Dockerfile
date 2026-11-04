@@ -30,3 +30,6 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 CMD ["/app/start.sh"]
+
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
